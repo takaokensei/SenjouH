@@ -1,0 +1,403 @@
+version: '3.8'
+
+# ============================================================================
+# Hitagi Companion System - Docker Compose
+# Infraestrutura completa de microserviços
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # MESSAGE BROKER & CACHE
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: hitagi-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # DATABASE
+  # ==========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: hitagi-postgres
+    environment:
+      POSTGRES_DB: hitagi_db
+      POSTGRES_USER: hitagi_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hitagi_user -d hitagi_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # VECTOR DATABASE
+  # ==========================================================================
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: hitagi-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # CORE SERVICES
+  # ==========================================================================
+  orchestrator:
+    build:
+      context: ./services/orchestrator
+      dockerfile: Dockerfile
+    container_name: hitagi-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_URL: postgresql://hitagi_user:${DB_PASSWORD:-changeme}@postgres:5432/hitagi_db
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  session_manager:
+    build:
+      context: ./services/session_manager
+      dockerfile: Dockerfile
+    container_name: hitagi-session-manager
+    environment:
+      REDIS_URL: redis://redis:6379
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      MAX_RECONNECT_ATTEMPTS: 5
+      BACKOFF_BASE: 2
+      SESSION_TIMEOUT: 1800
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis'); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # AUDIO SERVICES
+  # ==========================================================================
+  audio_ingest:
+    build:
+      context: ./services/audio_ingest
+      dockerfile: Dockerfile
+    container_name: hitagi-audio-ingest
+    devices:
+      - /dev/snd:/dev/snd  # Audio devices (Linux)
+    environment:
+      REDIS_URL: redis://redis:6379
+      SAMPLE_RATE: 16000
+      VAD_MODE: 3
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+    privileged: true  # Necessário para acesso a áudio
+
+  tts_service:
+    build:
+      context: ./services/tts
+      dockerfile: Dockerfile
+    container_name: hitagi-tts
+    environment:
+      REDIS_URL: redis://redis:6379
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      VOICE_PROVIDER: gemini
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./cache/tts:/app/cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # MEMORY & RAG
+  # ==========================================================================
+  memory_service:
+    build:
+      context: ./services/memory
+      dockerfile: Dockerfile
+    container_name: hitagi-memory
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_URL: postgresql://hitagi_user:${DB_PASSWORD:-changeme}@postgres:5432/hitagi_db
+      CHROMA_URL: http://chromadb:8000
+      EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # LIP-SYNC SERVICE (GPU)
+  # ==========================================================================
+  lipsync_service:
+    build:
+      context: ./services/lipsync
+      dockerfile: Dockerfile.gpu
+    container_name: hitagi-lipsync
+    runtime: nvidia
+    environment:
+      REDIS_URL: redis://redis:6379
+      CUDA_VISIBLE_DEVICES: "0"
+      MODEL_PATH: /app/models/wav2lip
+      BATCH_SIZE: 1
+      FPS: 30
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./models/wav2lip:/app/models/wav2lip
+      - ./cache/lipsync:/app/cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # AVATAR RENDERER
+  # ==========================================================================
+  avatar_renderer:
+    build:
+      context: ./services/avatar
+      dockerfile: Dockerfile
+    container_name: hitagi-avatar
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_URL: redis://redis:6379
+      WEBSOCKET_PORT: 8080
+      AVATAR_TYPE: live2d
+      MODEL_PATH: /app/models/hitagi_live2d
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./models/live2d:/app/models/hitagi_live2d
+      - ./assets:/app/assets
+    depends_on:
+      redis:
+        condition: service_healthy
+      lipsync_service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # MONITORING & OBSERVABILITY
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hitagi-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hitagi-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # NGINX API GATEWAY
+  # ==========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: hitagi-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./config/nginx/ssl:/etc/nginx/ssl
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - orchestrator
+      - avatar_renderer
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # ELASTICSEARCH (Optional - Advanced Logging)
+  # ==========================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: hitagi-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+    profiles:
+      - full  # Only start with --profile full
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: hitagi-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - hitagi-network
+    restart: unless-stopped
+    profiles:
+      - full
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+networks:
+  hitagi-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  chroma_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
